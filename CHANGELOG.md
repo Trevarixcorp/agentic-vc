@@ -7,6 +7,28 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- AVC now sets up OpenAI Codex and GitHub Copilot. `avc init --skills codex` adds the server to `.codex/config.toml` (keeping your comments and other settings) and the AVC rules to `AGENTS.md`. `avc init --skills copilot` writes `.vscode/mcp.json` in VS Code's `servers` format and Copilot instructions in `.github/instructions/avc.instructions.md`.
+- `avc init --hooks` installs each tool's pre-edit checkpoint hook: Claude Code, Windsurf (`pre_write_code`), Codex and Copilot. `avc hook pre-edit` now reads all of their payloads and records which tool took the checkpoint.
+- `avc doctor --agents` checks every configured tool: whether the MCP entry exists and its command runs, whether the rules match the configured tool tier, whether the files are gitignored, and whether the hook is installed. It exits 1 on a failure.
+- The MCP server now asks the client which folders are open (MCP roots) and selects the AVC project they belong to. A single global server config — Windsurf, Codex or VS Code user settings — now finds the right project instead of offering only `avc_init`.
+- Each tool's init output ends with what to do next in that tool, instead of a generic "start the MCP server" line.
+
+### Changed
+
+- The agent files `avc init --skills` writes are no longer added to `.gitignore`, so teammates who clone the repository get the same setup. Pass `--local` for the previous behaviour.
+- `generic` now writes its rules to `AGENTS.md`, which most agents read automatically, instead of `AGENT_INSTRUCTIONS.md`.
+- Windsurf rules now go to `.windsurf/rules/avc.md` with `trigger: always_on`. An AVC section left in the legacy `.windsurfrules` is moved there. The global Windsurf entry now lists each project set up with it as a search root.
+- Every tool's rules now come from one template, written for the tool tier in that tool's config. The rules no longer tell agents to call `avc_run_in_workspace` on the default `standard` tier, which does not expose it.
+
+### Fixed
+
+- Cursor's `.cursor/rules/avc.mdc` now carries `alwaysApply: true` frontmatter. Without it, Cursor treated the rule as manual-only, and agents never saw it unless someone typed `@avc`. Re-running `avc init --skills cursor` fixes existing files.
+- Re-running `avc init --skills` now refreshes rules AVC wrote earlier, instead of skipping any file that already exists. Files you wrote are still never touched.
+- An unknown `--skills` value is now rejected before anything is written. It used to leave a half-initialized project behind.
+- The MCP server no longer answers a client's response to one of its own requests with a "method not found" error.
+
 ## [0.5.0] - 2026-08-17
 
 ### Added
