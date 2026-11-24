@@ -52,17 +52,13 @@ func projectPath(rel string) func(string) (string, error) {
 	return func(root string) (string, error) { return filepath.Join(root, rel), nil }
 }
 
-func globalPath(fn func() (string, error)) func(string) (string, error) {
-	return func(string) (string, error) { return fn() }
-}
-
 // layouts covers every framework whose setup the doctor can verify.
 var layouts = map[string]layout{
 	FrameworkClaudeCode: {projectPath(projectMCPFile), claudeMDFile, rulesBlock, "", claudeCodeLocation},
 	FrameworkCursor:     {projectPath(cursorMCPFile), cursorRulesFile, rulesManaged, cursorFrontmatter, cursorLocation},
-	FrameworkWindsurf:   {globalPath(windsurfGlobalMCPPath), windsurfRulesFile, rulesManaged, windsurfFrontmatter, windsurfLocation},
+	FrameworkWindsurf:   {projectPath(devinMCPFile), windsurfRulesFile, rulesManaged, windsurfFrontmatter, windsurfLocation},
 	FrameworkCodex:      {projectPath(codexConfigFile), agentsMDFile, rulesBlock, "", agentsMDServerNote},
-	FrameworkCopilot:    {projectPath(vscodeMCPFile), copilotRulesFile, rulesManaged, copilotFrontmatter, copilotLocation},
+	FrameworkCopilot:    {projectPath(projectMCPFile), copilotRulesFile, rulesManaged, copilotFrontmatter, copilotLocation},
 }
 
 // Diagnose reports, for every framework that appears to be set up in the
@@ -86,8 +82,8 @@ func detected(projectRoot, fw string, l layout) bool {
 	if fw != FrameworkCodex && fileExists(filepath.Join(projectRoot, l.rulesRel)) {
 		return true
 	}
-	if fw == FrameworkWindsurf {
-		return false // its MCP config is global, shared by every project
+	if fw == FrameworkCopilot {
+		return false // its .mcp.json is shared with Claude Code
 	}
 	p, _ := l.mcpPath(projectRoot)
 	return fileExists(p)
@@ -124,15 +120,11 @@ func readServerEntry(fw, path string) *serverEntry {
 		return &serverEntry{command: s.Command, args: s.Args}
 	}
 
-	key := keyMCPServers
-	if fw == FrameworkCopilot {
-		key = keyVSCode
-	}
 	root, existed, err := readJSONObject(path)
 	if err != nil || !existed {
 		return nil
 	}
-	servers, _ := root[key].(map[string]any)
+	servers, _ := root[keyMCPServers].(map[string]any)
 	raw, ok := servers["avc"].(map[string]any)
 	if !ok {
 		return nil
@@ -168,8 +160,6 @@ func checkServer(fw, projectRoot, path string, e *serverEntry) Check {
 		c.Status, c.Detail = StatusFail, "no avc entry in "+path+" — run avc init --skills "+fw
 	case !commandRuns(e.command):
 		c.Status, c.Detail = StatusFail, "command "+e.command+" not found — install avc on PATH and re-run avc init --skills "+fw
-	case fw == FrameworkWindsurf && !argsInclude(e.args, projectRoot):
-		c.Status, c.Detail = StatusWarn, "this project is not among the server's search roots; it is found only if Windsurf reports it as an MCP root — run avc init --skills windsurf"
 	default:
 		c.Status, c.Detail = StatusOK, e.command+" mcp serve, tool tier "+tierOf(e)
 	}
@@ -187,15 +177,6 @@ func commandRuns(command string) bool {
 	}
 	_, err := exec.LookPath(command)
 	return err == nil
-}
-
-func argsInclude(args []string, dir string) bool {
-	for _, a := range args {
-		if filepath.Clean(a) == filepath.Clean(dir) {
-			return true
-		}
-	}
-	return false
 }
 
 // checkRules compares the rules on disk with what init would write for the
@@ -262,21 +243,15 @@ func gitignoredEntries(projectRoot string) map[string]bool {
 
 func checkHook(projectRoot, fw string) Check {
 	c := Check{Name: "pre-edit hook"}
-	spec, ok := hookSpecs[fw]
-	if !ok {
+	installed, available, rel := hookInstalled(projectRoot, fw)
+	switch {
+	case !available:
 		c.Status, c.Detail = StatusInfo, "not available for "+fw
-		return c
+	case installed:
+		c.Status, c.Detail = StatusOK, "installed in "+filepath.ToSlash(rel)
+	default:
+		c.Status, c.Detail = StatusInfo, "not installed — avc init --skills "+fw+" --hooks adds a checkpoint before each session's first edit"
 	}
-	root, _, err := readJSONObject(filepath.Join(projectRoot, spec.rel))
-	if err == nil {
-		if hooks, ok := root["hooks"].(map[string]any); ok {
-			if list, ok := hooks[spec.event].([]any); ok && containsPreEdit(list) {
-				c.Status, c.Detail = StatusOK, "installed in "+filepath.ToSlash(spec.rel)
-				return c
-			}
-		}
-	}
-	c.Status, c.Detail = StatusInfo, "not installed — avc init --skills "+fw+" --hooks adds a checkpoint before each session's first edit"
 	return c
 }
 

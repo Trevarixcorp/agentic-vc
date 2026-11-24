@@ -71,6 +71,28 @@ func toolFilePath(raw map[string]any) string {
 	return ""
 }
 
+// cursorAllow is Cursor's answer for its preToolUse permission hook. Cursor
+// treats invalid JSON on stdout as a denial, so without it the hook would
+// block the edit it exists to protect.
+const cursorAllow = `{"permission":"allow"}`
+
+// HarnessReply returns what the pre-edit hook must print on stdout for the
+// harness that ran it, and whether the human-readable report must stay off
+// stdout. Hooks run before a tool call, where harnesses read stdout as a
+// decision: Cursor needs an explicit allow, and the others (Codex, Copilot,
+// Devin/Windsurf) are safest given nothing. With no harness named — Claude
+// Code's plugin hook — the report prints as usual.
+func HarnessReply(harness string) (stdout string, quiet bool) {
+	switch harness {
+	case "":
+		return "", false
+	case "cursor":
+		return cursorAllow, true
+	default:
+		return "", true
+	}
+}
+
 // firstString returns the first non-empty string value among keys.
 func firstString(m map[string]any, keys []string) string {
 	for _, k := range keys {

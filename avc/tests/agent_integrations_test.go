@@ -109,9 +109,31 @@ func TestCursorRulesAlwaysApplyAndLegacyRefresh(t *testing.T) {
 	}
 }
 
+// TestWindsurfProjectConfigForDevinDesktop covers Windsurf after its rename to
+// Devin Desktop: the server goes in the project-level .devin/mcp_config.json,
+// and no global config is created when no pre-rename Windsurf is installed.
+func TestWindsurfProjectConfigForDevinDesktop(t *testing.T) {
+	home := fakeHome(t)
+	project := t.TempDir()
+	writeFW(t, project, skills.FrameworkWindsurf, skills.Options{})
+
+	servers := readMCPServers(t, filepath.Join(project, ".devin", "mcp_config.json"))
+	entry, ok := servers["avc"].(map[string]any)
+	if !ok || entry["command"] == "" {
+		t.Fatalf(".devin/mcp_config.json has no avc entry: %v", servers)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codeium")); !os.IsNotExist(err) {
+		t.Error("created a pre-rename Windsurf global config on a machine without Windsurf")
+	}
+}
+
 func TestWindsurfGlobalRootsAndRulesMigration(t *testing.T) {
 	home := fakeHome(t)
 	projectA, projectB := t.TempDir(), t.TempDir()
+	// A pre-rename Windsurf install keeps its global config here.
+	if err := os.MkdirAll(filepath.Join(home, ".codeium", "windsurf"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	// Legacy rules block alongside the user's own Windsurf rules.
 	legacy := filepath.Join(projectA, ".windsurfrules")
@@ -183,8 +205,15 @@ func TestCodexConfigMergePreservesUserConfig(t *testing.T) {
 func TestCopilotVSCodeConfigAndJSONCSafety(t *testing.T) {
 	fakeHome(t)
 	project := t.TempDir()
-	writeFW(t, project, skills.FrameworkCopilot, skills.Options{})
+	r0 := writeFW(t, project, skills.FrameworkCopilot, skills.Options{})
 
+	// The Copilot agent reads the portable .mcp.json (mcpServers).
+	portable := readMCPServers(t, filepath.Join(project, ".mcp.json"))
+	if e, ok := portable["avc"].(map[string]any); !ok || e["type"] != "stdio" {
+		t.Fatalf(".mcp.json needs mcpServers.avc with type stdio, got %v", portable)
+	}
+
+	// VS Code's older Local mode reads .vscode/mcp.json (servers).
 	var cfg map[string]any
 	if err := json.Unmarshal([]byte(mustRead(t, filepath.Join(project, ".vscode", "mcp.json"))), &cfg); err != nil {
 		t.Fatal(err)
@@ -192,6 +221,14 @@ func TestCopilotVSCodeConfigAndJSONCSafety(t *testing.T) {
 	entry, ok := cfg["servers"].(map[string]any)["avc"].(map[string]any)
 	if !ok || entry["type"] != "stdio" {
 		t.Fatalf(`.vscode/mcp.json needs servers.avc with type stdio, got %v`, cfg)
+	}
+	if _, set := entry["cwd"]; set {
+		t.Error(".vscode/mcp.json should not set cwd: VS Code defaults it to the workspace folder")
+	}
+
+	// The coding agent reads no file; the next steps give its settings JSON.
+	if !strings.Contains(strings.Join(r0.NextSteps, "\n"), `"type": "local"`) {
+		t.Errorf("next steps lack the coding agent MCP JSON: %v", r0.NextSteps)
 	}
 	instr := mustRead(t, filepath.Join(project, ".github", "instructions", "avc.instructions.md"))
 	if !strings.Contains(instr, `applyTo: "**"`) {
@@ -249,7 +286,7 @@ func TestRulesFollowConfiguredTier(t *testing.T) {
 		t.Error("standard-tier rules mention avc_run_in_workspace, which standard does not expose")
 	}
 
-	cfgPath := filepath.Join(project, ".vscode", "mcp.json")
+	cfgPath := filepath.Join(project, ".mcp.json")
 	mustWrite(t, cfgPath, strings.Replace(mustRead(t, cfgPath), `"standard"`, `"full"`, 1))
 	writeFW(t, project, skills.FrameworkCopilot, skills.Options{})
 	if !strings.Contains(mustRead(t, rulesPath), "avc_run_in_workspace") {
@@ -264,24 +301,51 @@ func TestHooksInstalledPerHarnessAndIdempotent(t *testing.T) {
 	mustWrite(t, filepath.Join(project, ".windsurf", "hooks.json"),
 		`{"hooks":{"pre_write_code":[{"command":"lint"}]}}`)
 
-	cases := map[string]string{
-		skills.FrameworkWindsurf: ".windsurf/hooks.json",
-		skills.FrameworkCodex:    ".codex/hooks.json",
-		skills.FrameworkCopilot:  ".github/hooks/avc.json",
+	// Each harness's hooks files, in the format its documentation gives.
+	cases := []struct {
+		fw, rel, want string
+	}{
+		{skills.FrameworkWindsurf, ".devin/hooks.v1.json", `"PreToolUse"`},
+		{skills.FrameworkWindsurf, ".windsurf/hooks.json", `"pre_write_code"`},
+		{skills.FrameworkCodex, ".codex/hooks.json", `"apply_patch|Edit|Write"`},
+		{skills.FrameworkCopilot, ".github/hooks/avc.json", `"version": 1`},
+		{skills.FrameworkCursor, ".cursor/hooks.json", `"preToolUse"`},
 	}
-	for fw, rel := range cases {
-		writeFW(t, project, fw, skills.Options{Hooks: true})
-		content := mustRead(t, filepath.Join(project, filepath.FromSlash(rel)))
-		if !strings.Contains(content, "avc hook pre-edit --agent "+fw) {
-			t.Errorf("%s: hook not installed with --agent:\n%s", rel, content)
+	for _, c := range cases {
+		writeFW(t, project, c.fw, skills.Options{Hooks: true})
+		content := mustRead(t, filepath.Join(project, filepath.FromSlash(c.rel)))
+		if !strings.Contains(content, "avc hook pre-edit --agent "+c.fw) || !strings.Contains(content, c.want) {
+			t.Errorf("%s: hook missing --agent or %s:\n%s", c.rel, c.want, content)
 		}
-		r := writeFW(t, project, fw, skills.Options{Hooks: true})
-		if got := statusOf(r, rel); got != "skipped" {
-			t.Errorf("%s second run status = %q, want skipped", rel, got)
+		r := writeFW(t, project, c.fw, skills.Options{Hooks: true})
+		if got := statusOf(r, c.rel); got != "skipped" {
+			t.Errorf("%s second run status = %q, want skipped", c.rel, got)
 		}
 	}
 	if !strings.Contains(mustRead(t, filepath.Join(project, ".windsurf", "hooks.json")), `"lint"`) {
 		t.Error("existing Windsurf hook was dropped")
+	}
+	// Devin's hooks.v1.json holds the event map directly, with no wrapper.
+	if strings.Contains(mustRead(t, filepath.Join(project, ".devin", "hooks.v1.json")), `"hooks": {`) {
+		t.Error(".devin/hooks.v1.json must not wrap events in a hooks object")
+	}
+}
+
+// TestHarnessReplyKeepsHooksFromBlockingEdits checks what the pre-edit hook
+// prints for each harness: Cursor's preToolUse treats non-JSON as a denial,
+// so it gets an explicit allow; the others read stdout as a decision too, so
+// they get nothing.
+func TestHarnessReplyKeepsHooksFromBlockingEdits(t *testing.T) {
+	if out, quiet := agenthook.HarnessReply("cursor"); !quiet || out != `{"permission":"allow"}` {
+		t.Errorf("cursor reply = %q quiet=%v, want an allow JSON", out, quiet)
+	}
+	for _, h := range []string{"codex", "copilot", "windsurf"} {
+		if out, quiet := agenthook.HarnessReply(h); !quiet || out != "" {
+			t.Errorf("%s reply = %q quiet=%v, want silence on stdout", h, out, quiet)
+		}
+	}
+	if _, quiet := agenthook.HarnessReply(""); quiet {
+		t.Error("Claude Code's hook (no --agent) should keep its readable report")
 	}
 }
 
@@ -311,8 +375,8 @@ func TestDoctorFlagsStaleRulesAndMissingCommand(t *testing.T) {
 		t.Errorf("edited rules should warn: %+v", c)
 	}
 
-	cfgPath := filepath.Join(project, ".vscode", "mcp.json")
-	mustWrite(t, cfgPath, `{"servers":{"avc":{"type":"stdio","command":"C:/no/such/avc.exe","args":["mcp","serve"]}}}`)
+	cfgPath := filepath.Join(project, ".mcp.json")
+	mustWrite(t, cfgPath, `{"mcpServers":{"avc":{"type":"stdio","command":"C:/no/such/avc.exe","args":["mcp","serve"]}}}`)
 	if c := byName()["mcp server"]; c.Status != skills.StatusFail {
 		t.Errorf("missing command should fail: %+v", c)
 	}

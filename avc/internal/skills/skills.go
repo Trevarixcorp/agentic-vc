@@ -195,6 +195,7 @@ var (
 	windsurfRulesFile  = filepath.Join(".windsurf", "rules", "avc.md")
 	codexConfigFile    = filepath.Join(".codex", "config.toml")
 	vscodeMCPFile      = filepath.Join(".vscode", "mcp.json")
+	devinMCPFile       = filepath.Join(".devin", "mcp_config.json")
 	copilotRulesFile   = filepath.Join(".github", "instructions", "avc.instructions.md")
 	agentsMDServerNote = "configured in your agent's MCP settings (`avc init --skills <tool>` writes them)"
 )
@@ -203,8 +204,8 @@ var (
 const (
 	claudeCodeLocation = "configured in `.mcp.json` and starts automatically"
 	cursorLocation     = "configured in `.cursor/mcp.json` and starts automatically"
-	windsurfLocation   = "configured in Windsurf's global `mcp_config.json`"
-	copilotLocation    = "configured in `.vscode/mcp.json`"
+	windsurfLocation   = "configured in `.devin/mcp_config.json`"
+	copilotLocation    = "configured in `.mcp.json` (and `.vscode/mcp.json` for VS Code's older Local mode)"
 )
 
 // Rule-file frontmatter. Each tool reads its own header to decide when a rule
@@ -297,14 +298,57 @@ func writeCursor(projectRoot string, r *WriteResult) error {
 	return nil
 }
 
+// writeWindsurf sets up Windsurf, which became Devin Desktop.
+//
+// Devin Desktop reads a project-level .devin/mcp_config.json (mcpServers),
+// shared through version control, so the server is scoped to this project.
+// Windsurf before the rename had only the global
+// ~/.codeium/windsurf/mcp_config.json; that entry is written only when such
+// an install exists. Rules go to .windsurf/rules/avc.md, which both read.
 func writeWindsurf(projectRoot string, r *WriteResult) error {
-	// Windsurf has only a global MCP config, shared by every project. The
-	// server finds the open project from the roots Windsurf reports when it
-	// supports MCP roots; the project paths in args are the fallback search
-	// roots, accumulated across `avc init --skills windsurf` runs.
+	action, err := mergeJSONServer(projectServer(projectRoot, devinMCPFile, r))
+	if err != nil {
+		return err
+	}
+	r.Actions = append(r.Actions, fileAction(filepath.ToSlash(devinMCPFile), action))
+
+	if err := writeLegacyWindsurfServer(projectRoot, r); err != nil {
+		return err
+	}
+
+	content := renderManagedFile(windsurfFrontmatter, windsurfLocation, configuredTier(FrameworkWindsurf, filepath.Join(projectRoot, devinMCPFile)))
+	action, err = writeManagedFile(filepath.Join(projectRoot, windsurfRulesFile), content, nil)
+	if err != nil {
+		return err
+	}
+	r.Actions = append(r.Actions, fileAction(filepath.ToSlash(windsurfRulesFile), action))
+
+	// Older versions wrote the rules into the legacy .windsurfrules file. Two
+	// copies would drift, so the old AVC section is removed.
+	removed, err := removeBlock(filepath.Join(projectRoot, legacyWindsurfRules))
+	if err != nil {
+		return err
+	}
+	if removed != "" {
+		r.Actions = append(r.Actions, fileAction(legacyWindsurfRules, removed))
+		r.Warnings = append(r.Warnings, "moved the AVC rules from the legacy .windsurfrules to "+filepath.ToSlash(windsurfRulesFile))
+	}
+	r.NextSteps = append(r.NextSteps, "In Devin Desktop (formerly Windsurf), open the MCP servers panel and refresh so it loads avc from .devin/mcp_config.json.")
+	return nil
+}
+
+// writeLegacyWindsurfServer adds this project to the avc entry in a
+// pre-rename Windsurf's global MCP config, when that install exists. That
+// config is shared by every project, so each project is appended as a search
+// root rather than replacing the last; the server also selects the open
+// project from MCP roots.
+func writeLegacyWindsurfServer(projectRoot string, r *WriteResult) error {
 	globalMCP, err := windsurfGlobalMCPPath()
 	if err != nil {
 		return err
+	}
+	if !fileExists(filepath.Dir(globalMCP)) {
+		return nil // no pre-rename Windsurf on this machine
 	}
 	root, _, err := readJSONObject(globalMCP)
 	if err != nil {
@@ -327,25 +371,9 @@ func writeWindsurf(projectRoot string, r *WriteResult) error {
 		return err
 	}
 	r.Actions = append(r.Actions, fileAction(globalMCP, action))
-
-	content := renderManagedFile(windsurfFrontmatter, windsurfLocation, configuredTier(FrameworkWindsurf, globalMCP))
-	action, err = writeManagedFile(filepath.Join(projectRoot, windsurfRulesFile), content, nil)
-	if err != nil {
-		return err
+	if action != skipAlreadyConfigured {
+		r.Warnings = append(r.Warnings, "also registered avc in the pre-rename Windsurf global config; Devin Desktop uses .devin/mcp_config.json, so remove the global entry once you have moved to Devin Desktop")
 	}
-	r.Actions = append(r.Actions, fileAction(filepath.ToSlash(windsurfRulesFile), action))
-
-	// Older versions wrote the rules into the legacy .windsurfrules file. Two
-	// copies would drift, so the old AVC section is removed.
-	removed, err := removeBlock(filepath.Join(projectRoot, legacyWindsurfRules))
-	if err != nil {
-		return err
-	}
-	if removed != "" {
-		r.Actions = append(r.Actions, fileAction(legacyWindsurfRules, removed))
-		r.Warnings = append(r.Warnings, "moved the AVC rules from the legacy .windsurfrules to "+filepath.ToSlash(windsurfRulesFile))
-	}
-	r.NextSteps = append(r.NextSteps, "In Windsurf, open Settings → Cascade → MCP servers and refresh so it loads avc.")
 	return nil
 }
 
@@ -363,43 +391,56 @@ func writeCodex(projectRoot string, r *WriteResult) error {
 	return nil
 }
 
+// copilotCodingAgentConfig is the JSON a user pastes into the repository's
+// Settings → Copilot → MCP servers box for the Copilot coding agent, which
+// reads no MCP file from the repository. "tools" is required there.
+const copilotCodingAgentConfig = `{"mcpServers": {"avc": {"type": "local", "command": "avc", "args": ["mcp", "serve", "--tools", "` + defaultToolTier + `"], "tools": ["*"]}}}`
+
+// writeCopilot sets up GitHub Copilot in VS Code.
+//
+// VS Code's Copilot agent reads the portable .mcp.json (mcpServers) at the
+// workspace root — the same file Claude Code reads. The older .vscode/mcp.json
+// (servers) belongs to VS Code's Local agent mode, deprecated for removal in
+// February 2027, and is kept until then so both modes find the server.
 func writeCopilot(projectRoot string, r *WriteResult) error {
 	command := resolveProjectCommand(r)
-	action, err := mergeJSONServer(jsonServer{
-		path:       filepath.Join(projectRoot, vscodeMCPFile),
-		serversKey: keyVSCode,
-		name:       "avc",
-		entry: map[string]any{
-			"type":    "stdio",
-			"command": command,
-			"args":    serverArgs(),
-			"cwd":     "${workspaceFolder}",
-		},
-		matches: commandMatches(command, nil),
-	})
-	var syntaxErr *json.SyntaxError
-	if errors.As(err, &syntaxErr) {
-		// VS Code allows comments in mcp.json; rewriting such a file would
-		// strip them, so ask the user to add the entry instead.
-		r.Warnings = append(r.Warnings, fmt.Sprintf(
-			"%s is not plain JSON (it may contain comments), so it was left untouched — add an \"avc\" entry under \"servers\" with command %q and args %q",
-			filepath.ToSlash(vscodeMCPFile), command, strings.Join(serverArgs(), " ")))
-		action, err = "skipped:not plain JSON", nil
-	}
-	if err != nil {
-		return err
-	}
-	r.Actions = append(r.Actions, fileAction(filepath.ToSlash(vscodeMCPFile), action))
+	stdio := map[string]any{"type": "stdio", "command": command, "args": serverArgs()}
 
-	content := renderManagedFile(copilotFrontmatter, copilotLocation, configuredTier(FrameworkCopilot, filepath.Join(projectRoot, vscodeMCPFile)))
-	action, err = writeManagedFile(filepath.Join(projectRoot, copilotRulesFile), content, nil)
+	for _, target := range []struct{ rel, key string }{
+		{projectMCPFile, keyMCPServers},
+		{vscodeMCPFile, keyVSCode},
+	} {
+		action, err := mergeJSONServer(jsonServer{
+			path:       filepath.Join(projectRoot, target.rel),
+			serversKey: target.key,
+			name:       "avc",
+			entry:      stdio,
+			matches:    commandMatches(command, nil),
+		})
+		var syntaxErr *json.SyntaxError
+		if errors.As(err, &syntaxErr) {
+			// VS Code allows comments in its config files; rewriting such a
+			// file would strip them, so ask the user to add the entry instead.
+			r.Warnings = append(r.Warnings, fmt.Sprintf(
+				"%s is not plain JSON (it may contain comments), so it was left untouched — add an \"avc\" entry under %q with command %q and args %q",
+				filepath.ToSlash(target.rel), target.key, command, strings.Join(serverArgs(), " ")))
+			action, err = "skipped:not plain JSON", nil
+		}
+		if err != nil {
+			return err
+		}
+		r.Actions = append(r.Actions, fileAction(filepath.ToSlash(target.rel), action))
+	}
+
+	content := renderManagedFile(copilotFrontmatter, copilotLocation, configuredTier(FrameworkCopilot, filepath.Join(projectRoot, projectMCPFile)))
+	action, err := writeManagedFile(filepath.Join(projectRoot, copilotRulesFile), content, nil)
 	if err != nil {
 		return err
 	}
 	r.Actions = append(r.Actions, fileAction(filepath.ToSlash(copilotRulesFile), action))
 	r.NextSteps = append(r.NextSteps,
-		"In VS Code, open .vscode/mcp.json and press Start on the avc server.",
-		"For the Copilot coding agent on GitHub, add the avc server in the repository's Copilot settings and install avc in its setup steps.")
+		"VS Code's Copilot agent reads .mcp.json at the workspace root while the chat.mcp.workspaceRootConfig.enabled setting is on (experimental); its older Local mode reads .vscode/mcp.json. Start the avc server from the MCP servers list.",
+		"For the Copilot coding agent on GitHub, paste this into the repository's Settings → Copilot → MCP servers, and install avc in .github/workflows/copilot-setup-steps.yml: "+copilotCodingAgentConfig)
 	return nil
 }
 

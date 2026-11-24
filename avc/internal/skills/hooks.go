@@ -15,98 +15,171 @@ import (
 // vetoes the action.
 const preEditCommand = "avc hook pre-edit"
 
-// hookCommandFor returns the hook command for framework, naming the harness so
-// the checkpoint is attributed to it.
+// hookCommandFor returns the hook command for framework. Naming the harness
+// attributes the checkpoint to it and selects the stdout the harness expects
+// (Cursor needs a JSON permission answer; the others need silence).
 func hookCommandFor(framework string) string {
 	return preEditCommand + " --agent " + framework
 }
 
-// hookSpec describes where one harness keeps project hooks and how one AVC
-// hook entry looks there.
+// hookSpec describes one hooks file a harness reads and the AVC entry in it.
 type hookSpec struct {
-	rel     string         // project-relative hooks file
-	topKeys map[string]any // top-level keys the file format requires
-	event   string         // event name under "hooks"
-	entry   any            // the entry appended to that event's list
-	note    string         // caveat shown to the user, or ""
+	rel string // project-relative hooks file
+	// unwrapped means the file's top level is the event map itself (Devin's
+	// hooks.v1.json); otherwise events sit under a top-level "hooks" key.
+	unwrapped bool
+	topKeys   map[string]any // other top-level keys the format requires
+	event     string         // event name
+	entry     any            // the entry appended to that event's list
 }
 
-// hookSpecs maps each framework that has a project-level pre-edit hook to its
-// spec. Frameworks absent here have no such hook to install.
-var hookSpecs = map[string]hookSpec{
-	FrameworkClaudeCode: {
+// hookFiles describes, per framework, the hooks files to install the pre-edit
+// checkpoint into, and a caveat to show the user. Frameworks absent here have
+// no project-level hook that runs before an edit.
+//
+// Formats follow each tool's documentation (November 2026):
+//   - Claude Code: .claude/settings.json, PreToolUse matching Write|Edit.
+//   - Windsurf, now Devin Desktop: .devin/hooks.v1.json holds the event map
+//     directly, Claude-style PreToolUse groups. The legacy Windsurf
+//     .windsurf/hooks.json pre_write_code hook is kept for older versions.
+//   - Codex: .codex/hooks.json; apply_patch edits match apply_patch|Edit|Write.
+//   - Copilot: .github/hooks/*.json, "version": 1.
+//   - Cursor: .cursor/hooks.json, "version": 1; preToolUse matching Write is
+//     the only event before an edit (afterFileEdit runs too late).
+var hookFiles = map[string]struct {
+	specs []hookSpec
+	note  string
+}{
+	FrameworkClaudeCode: {specs: []hookSpec{{
 		rel:   filepath.Join(".claude", "settings.json"),
 		event: "PreToolUse",
 		entry: map[string]any{
 			"matcher": "Write|Edit",
 			"hooks":   []any{map[string]any{"type": "command", "command": preEditCommand}},
 		},
-	},
-	FrameworkWindsurf: {
-		rel:   filepath.Join(".windsurf", "hooks.json"),
-		event: "pre_write_code",
-		entry: map[string]any{"command": hookCommandFor(FrameworkWindsurf), "show_output": false},
-	},
-	FrameworkCodex: {
-		rel:   filepath.Join(".codex", "hooks.json"),
-		event: "PreToolUse",
-		entry: map[string]any{
-			"hooks": []any{map[string]any{"type": "command", "command": hookCommandFor(FrameworkCodex)}},
+	}}},
+	FrameworkWindsurf: {specs: []hookSpec{
+		{
+			rel:       filepath.Join(".devin", "hooks.v1.json"),
+			unwrapped: true,
+			event:     "PreToolUse",
+			entry: map[string]any{
+				"hooks": []any{map[string]any{"type": "command", "command": hookCommandFor(FrameworkWindsurf)}},
+			},
 		},
-		note: "Codex loads project hooks only for trusted projects, and its PreToolUse event may fire only for shell commands — the checkpoint is then taken before the session's first command rather than its first edit.",
+		{
+			rel:   filepath.Join(".windsurf", "hooks.json"),
+			event: "pre_write_code",
+			entry: map[string]any{"command": hookCommandFor(FrameworkWindsurf), "show_output": false},
+		},
+	}},
+	FrameworkCodex: {
+		specs: []hookSpec{{
+			rel:   filepath.Join(".codex", "hooks.json"),
+			event: "PreToolUse",
+			entry: map[string]any{
+				"matcher": "apply_patch|Edit|Write",
+				"hooks":   []any{map[string]any{"type": "command", "command": hookCommandFor(FrameworkCodex)}},
+			},
+		}},
+		note: "Codex loads project hooks only for trusted projects, and asks you to review new hooks once — run /hooks in Codex to trust it.",
 	},
 	FrameworkCopilot: {
-		rel:     filepath.Join(".github", "hooks", "avc.json"),
-		topKeys: map[string]any{"version": 1},
-		event:   "PreToolUse",
-		entry:   map[string]any{"type": "command", "command": hookCommandFor(FrameworkCopilot)},
-		note:    "Copilot agent hooks are in preview in VS Code; check that hooks are enabled in your build.",
+		specs: []hookSpec{{
+			rel:     filepath.Join(".github", "hooks", "avc.json"),
+			topKeys: map[string]any{"version": 1},
+			event:   "PreToolUse",
+			entry:   map[string]any{"type": "command", "command": hookCommandFor(FrameworkCopilot)},
+		}},
+		note: "Copilot reads .github/hooks/avc.json in VS Code agent sessions, the Copilot CLI and the coding agent; VS Code's agent hooks may still be in preview in your build.",
 	},
+	FrameworkCursor: {specs: []hookSpec{{
+		rel:     filepath.Join(".cursor", "hooks.json"),
+		topKeys: map[string]any{"version": 1},
+		event:   "preToolUse",
+		entry:   map[string]any{"command": hookCommandFor(FrameworkCursor), "matcher": "Write"},
+	}}},
 }
 
-// writeHook installs the AVC pre-edit hook for framework, if it has one,
-// merging into an existing hooks file without disturbing other hooks.
+// writeHook installs the AVC pre-edit hook for framework into every hooks
+// file it reads, merging without disturbing other hooks.
 func writeHook(projectRoot, framework string, r *WriteResult) error {
-	spec, ok := hookSpecs[framework]
+	files, ok := hookFiles[framework]
 	if !ok {
 		r.Warnings = append(r.Warnings, framework+" has no project-level pre-edit hook; --hooks was ignored for it")
 		return nil
 	}
+	installed := false
+	for _, spec := range files.specs {
+		action, err := installHook(projectRoot, spec)
+		if err != nil {
+			return err
+		}
+		r.Actions = append(r.Actions, fileAction(filepath.ToSlash(spec.rel), action))
+		installed = installed || action != skipAlreadyConfigured
+	}
+	if installed && files.note != "" {
+		r.Warnings = append(r.Warnings, files.note)
+	}
+	return nil
+}
+
+// installHook merges one AVC hook entry into one hooks file.
+func installHook(projectRoot string, spec hookSpec) (string, error) {
 	path := filepath.Join(projectRoot, spec.rel)
 	root, existed, err := readJSONObject(path)
 	if err != nil {
-		return err
+		return "", err
 	}
-
 	for k, v := range spec.topKeys {
 		if _, set := root[k]; !set {
 			root[k] = v
 		}
+	}
+	events := eventMap(root, spec)
+	list, _ := events[spec.event].([]any)
+	if containsPreEdit(list) {
+		return skipAlreadyConfigured, nil
+	}
+	events[spec.event] = append(list, spec.entry)
+
+	if err := writeJSON(path, root); err != nil {
+		return "", err
+	}
+	if existed {
+		return actionUpdated, nil
+	}
+	return actionCreated, nil
+}
+
+// eventMap returns the map holding a hooks file's events, creating the
+// "hooks" key when the format wraps events in one.
+func eventMap(root map[string]any, spec hookSpec) map[string]any {
+	if spec.unwrapped {
+		return root
 	}
 	hooks, ok := root["hooks"].(map[string]any)
 	if !ok {
 		hooks = map[string]any{}
 		root["hooks"] = hooks
 	}
-	list, _ := hooks[spec.event].([]any)
-	if containsPreEdit(list) {
-		r.Actions = append(r.Actions, fileAction(filepath.ToSlash(spec.rel), skipAlreadyConfigured))
-		return nil
-	}
-	hooks[spec.event] = append(list, spec.entry)
+	return hooks
+}
 
-	if err := writeJSON(path, root); err != nil {
-		return err
+// hookInstalled reports whether a framework's primary hooks file already runs
+// the AVC command, and names that file.
+func hookInstalled(projectRoot, framework string) (installed, available bool, rel string) {
+	files, ok := hookFiles[framework]
+	if !ok || len(files.specs) == 0 {
+		return false, false, ""
 	}
-	action := actionCreated
-	if existed {
-		action = actionUpdated
+	spec := files.specs[0]
+	root, _, err := readJSONObject(filepath.Join(projectRoot, spec.rel))
+	if err != nil {
+		return false, true, spec.rel
 	}
-	r.Actions = append(r.Actions, fileAction(filepath.ToSlash(spec.rel), action))
-	if spec.note != "" {
-		r.Warnings = append(r.Warnings, spec.note)
-	}
-	return nil
+	list, _ := eventMap(root, spec)[spec.event].([]any)
+	return containsPreEdit(list), true, spec.rel
 }
 
 // containsPreEdit reports whether any hook entry already runs the AVC command.

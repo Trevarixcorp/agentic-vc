@@ -47,8 +47,10 @@ Accepts a comma-separated list of frameworks:
 
 MCP configs are written at the project level where the framework supports it
 (claude-code: .mcp.json, cursor: .cursor/mcp.json, codex: .codex/config.toml,
-copilot: .vscode/mcp.json), so the server is scoped to this project. claude-desktop
-and windsurf only support global configs and write to their home-directory file.
+copilot: .mcp.json plus .vscode/mcp.json, windsurf/Devin Desktop:
+.devin/mcp_config.json), so the server is scoped to this project. claude-desktop
+only supports a global config; a pre-rename Windsurf install also gets an entry
+in its global config.
 
 Agent rules go where each tool reads them: CLAUDE.md, .cursor/rules/avc.mdc,
 .windsurf/rules/avc.md, .github/instructions/avc.instructions.md, and AGENTS.md
@@ -58,7 +60,7 @@ never overwritten.
 The generated files are left trackable so teammates get the same setup. Pass
 --local to add them to .gitignore instead. Pass --hooks to also install the
 tool's pre-edit hook, which checkpoints before an agent session's first edit
-(claude-code, windsurf, codex, copilot).
+(claude-code, cursor, windsurf, codex, copilot).
 
 Supported frameworks: ` + strings.Join(skills.SupportedFrameworks, ", "),
 	Args: cobra.MaximumNArgs(1),

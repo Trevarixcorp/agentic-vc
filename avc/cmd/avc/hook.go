@@ -66,6 +66,16 @@ func runHookPreEdit(cmd *cobra.Command, args []string) error {
 		return reportHookFailure(err)
 	}
 
+	reply, quiet := agenthook.HarnessReply(hookAgent)
+	if quiet {
+		// The harness reads stdout as its decision: answer it, and keep the
+		// report on stderr where it is shown as a log line, if at all.
+		fmt.Fprintf(os.Stderr, "[avc] pre-edit hook: %s %s\n", result.Action, result.SnapshotID+result.Reason)
+		if reply != "" {
+			fmt.Println(reply)
+		}
+		return nil
+	}
 	if jsonOutput {
 		return json.NewEncoder(os.Stdout).Encode(result)
 	}
@@ -91,6 +101,13 @@ func readHookInput(r io.Reader) (agenthook.Input, error) {
 // still exits 0. A hook handler must never turn an AVC problem into a blocked
 // edit, so this deliberately breaks the usual "errors propagate up" rule.
 func reportHookFailure(err error) error {
+	if reply, quiet := agenthook.HarnessReply(hookAgent); quiet {
+		fmt.Fprintf(os.Stderr, "[avc] warning: pre-edit hook skipped: %v\n", err)
+		if reply != "" {
+			fmt.Println(reply)
+		}
+		return nil
+	}
 	if jsonOutput {
 		return json.NewEncoder(os.Stdout).Encode(agenthook.Result{
 			Action: agenthook.ActionSkipped,
